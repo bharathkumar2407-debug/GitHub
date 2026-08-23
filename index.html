@@ -69,9 +69,9 @@
   .data-panel{
     background:var(--panel);
     border:1px solid var(--line);
-    border-radius:10px;
-    padding:14px 16px;
-    margin-bottom:18px;
+    border-radius:8px;
+    padding:8px 12px;
+    margin-bottom:12px;
   }
   .data-panel .row{
     display:flex;
@@ -80,31 +80,31 @@
     gap:10px;
   }
   .data-panel .label{
-    font-size:11px;
+    font-size:9px;
     text-transform:uppercase;
     letter-spacing:0.8px;
     color:var(--text-dim);
-    margin-bottom:2px;
+    margin-bottom:1px;
   }
   .data-panel .count{
     font-family:var(--mono);
-    font-size:14px;
+    font-size:12px;
   }
   .data-panel .count.zero{ color:var(--red); }
   .data-panel .btns{
     display:flex;
-    gap:8px;
+    gap:6px;
     flex-shrink:0;
   }
   .data-panel button{
-    padding:9px 12px;
-    font-size:13px;
+    padding:6px 9px;
+    font-size:11px;
   }
   .data-panel input[type=file]{ display:none; }
   .data-panel .filename{
-    font-size:11px;
+    font-size:10px;
     color:var(--text-dim);
-    margin-top:6px;
+    margin-top:3px;
     font-family:var(--mono);
     word-break:break-all;
   }
@@ -1036,6 +1036,32 @@ function showNoMatch(readText){
   noMatchEl.classList.add('show');
 }
 
+function otsuThreshold(gray, length){
+  // Picks the black/white cutoff automatically from the image's own brightness
+  // distribution, instead of guessing one fixed percentage — adapts per photo
+  // (bright label vs dim label, glare vs shade) far better than a fixed split.
+  const histogram = new Array(256).fill(0);
+  for(let i = 0; i < length; i++) histogram[gray[i]]++;
+  let sum = 0;
+  for(let t = 0; t < 256; t++) sum += t * histogram[t];
+  let sumB = 0, wB = 0, varMax = 0, threshold = 128;
+  for(let t = 0; t < 256; t++){
+    wB += histogram[t];
+    if(wB === 0) continue;
+    const wF = length - wB;
+    if(wF === 0) break;
+    sumB += t * histogram[t];
+    const mB = sumB / wB;
+    const mF = (sum - sumB) / wF;
+    const varBetween = wB * wF * (mB - mF) * (mB - mF);
+    if(varBetween > varMax){
+      varMax = varBetween;
+      threshold = t;
+    }
+  }
+  return threshold;
+}
+
 function preprocessForOcr(sourceCanvas){
   // Crop to the visible guide frame (inset 18% top/bottom, 10% left/right — matches the CSS overlay)
   // so grid-paper background and glare outside the label don't confuse the OCR engine.
@@ -1044,26 +1070,30 @@ function preprocessForOcr(sourceCanvas){
   const sw = Math.round(sourceCanvas.width * 0.80);
   const sh = Math.round(sourceCanvas.height * 0.64);
 
-  const cropped = document.createElement('canvas');
-  cropped.width = sw;
-  cropped.height = sh;
-  const cctx = cropped.getContext('2d');
-  cctx.drawImage(sourceCanvas, sx, sy, sw, sh, 0, 0, sw, sh);
+  // OCR engines read small text unreliably — upscale so the cropped text has real pixel height.
+  const targetHeight = 320;
+  const scale = sh < targetHeight ? Math.min(3, targetHeight / sh) : 1;
+  const outW = Math.round(sw * scale);
+  const outH = Math.round(sh * scale);
 
-  // Grayscale + contrast stretch + threshold: makes printed text stand out from
-  // paper grid-lines and glare, which noticeably reduces OCR noise on label photos.
-  const imgData = cctx.getImageData(0, 0, sw, sh);
+  const cropped = document.createElement('canvas');
+  cropped.width = outW;
+  cropped.height = outH;
+  const cctx = cropped.getContext('2d');
+  cctx.imageSmoothingEnabled = true;
+  cctx.imageSmoothingQuality = 'high';
+  cctx.drawImage(sourceCanvas, sx, sy, sw, sh, 0, 0, outW, outH);
+
+  // Grayscale, then adaptive (Otsu) threshold: makes printed text stand out from
+  // paper grid-lines and glare far more consistently than a fixed contrast guess.
+  const imgData = cctx.getImageData(0, 0, outW, outH);
   const d = imgData.data;
-  let min = 255, max = 0;
-  const gray = new Uint8ClampedArray(sw * sh);
+  const pixelCount = outW * outH;
+  const gray = new Uint8ClampedArray(pixelCount);
   for(let i = 0, p = 0; i < d.length; i += 4, p++){
-    const g = 0.299*d[i] + 0.587*d[i+1] + 0.114*d[i+2];
-    gray[p] = g;
-    if(g < min) min = g;
-    if(g > max) max = g;
+    gray[p] = 0.299*d[i] + 0.587*d[i+1] + 0.114*d[i+2];
   }
-  const range = Math.max(1, max - min);
-  const threshold = min + range * 0.55;
+  const threshold = otsuThreshold(gray, pixelCount);
   for(let i = 0, p = 0; i < d.length; i += 4, p++){
     const v = gray[p] > threshold ? 255 : 0;
     d[i] = d[i+1] = d[i+2] = v;
@@ -1071,6 +1101,7 @@ function preprocessForOcr(sourceCanvas){
   cctx.putImageData(imgData, 0, 0);
   return cropped;
 }
+
 
 function performSearch(query, sourceLabel){
   if(PARTS.length === 0){
@@ -1117,7 +1148,7 @@ async function runOcr(){
         }
       },
       tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-/. ',
-      tessedit_pageseg_mode: 6
+      tessedit_pageseg_mode: 11
     });
     const text = (data.text || '').trim();
     const detectedBox = document.getElementById('detectedBox');
