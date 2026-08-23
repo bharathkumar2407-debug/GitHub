@@ -151,6 +151,21 @@
     text-shadow:0 1px 3px rgba(0,0,0,0.8);
     letter-spacing:0.5px;
   }
+  .cam-placeholder{
+    position:absolute;
+    inset:0;
+    background:var(--panel);
+    display:flex;
+    flex-direction:column;
+    align-items:center;
+    justify-content:center;
+    gap:10px;
+    cursor:pointer;
+    color:var(--text-dim);
+    font-size:14px;
+  }
+  .cam-placeholder.hide{ display:none; }
+  .cam-icon{ font-size:40px; }
   .controls{
     display:flex;
     gap:10px;
@@ -226,6 +241,28 @@
     color:var(--amber);
     word-break:break-word;
     white-space:pre-wrap;
+  }
+  .detected-row{
+    display:flex;
+    gap:8px;
+  }
+  .detected-row input{
+    flex:1;
+    background:var(--bg);
+    border:1px solid var(--line);
+    border-radius:6px;
+    padding:8px 10px;
+    color:var(--amber);
+    font-family:var(--mono);
+    font-size:13px;
+  }
+  .detected-row button{
+    padding:8px 14px;
+    font-size:13px;
+    background:var(--amber);
+    color:#241905;
+    border-color:var(--amber);
+    font-weight:600;
   }
 
   .plate{
@@ -438,6 +475,10 @@
     <canvas id="shot" class="shot"></canvas>
     <div class="frame"><i></i></div>
     <div class="hint" id="hint">Align part number in frame</div>
+    <div class="cam-placeholder" id="camPlaceholder">
+      <div class="cam-icon">&#128247;</div>
+      <div>Tap to open camera</div>
+    </div>
   </div>
 
   <div class="controls">
@@ -452,8 +493,11 @@
 
   <div class="status" id="status"></div>
   <div class="detected-box" id="detectedBox">
-    <label>Detected from camera</label>
-    <div class="detected-text" id="detectedText"></div>
+    <label>Detected from camera &mdash; edit if it read something wrong</label>
+    <div class="detected-row">
+      <input type="text" id="detectedInput">
+      <button id="detectedSearchBtn">Search</button>
+    </div>
   </div>
 
   <div class="plate" id="plate">
@@ -734,9 +778,11 @@ const manualInput = document.getElementById('manualInput');
 const manualBtn = document.getElementById('manualBtn');
 const plateEl = document.getElementById('plate');
 const noMatchEl = document.getElementById('noMatch');
+const camPlaceholder = document.getElementById('camPlaceholder');
 
 let currentStream = null;
 let facing = 'environment';
+let cameraStarted = false;
 
 async function startCamera(){
   if(currentStream){
@@ -748,17 +794,22 @@ async function startCamera(){
     });
     video.srcObject = currentStream;
     hintEl.textContent = 'Align part number in frame';
+    cameraStarted = true;
+    camPlaceholder.classList.add('hide');
   }catch(err){
     hintEl.textContent = 'Camera unavailable — use manual entry below';
     setStatus('Camera error: ' + err.message, true);
   }
 }
-startCamera();
+
+// Camera only opens when the person taps it — not automatically on page load.
+camPlaceholder.addEventListener('click', startCamera);
 
 switchBtn.addEventListener('click', () => {
   facing = facing === 'environment' ? 'user' : 'environment';
   startCamera();
 });
+
 
 function setStatus(text, isErr){
   statusEl.textContent = text || '';
@@ -985,9 +1036,69 @@ function showNoMatch(readText){
   noMatchEl.classList.add('show');
 }
 
+function preprocessForOcr(sourceCanvas){
+  // Crop to the visible guide frame (inset 18% top/bottom, 10% left/right — matches the CSS overlay)
+  // so grid-paper background and glare outside the label don't confuse the OCR engine.
+  const sx = Math.round(sourceCanvas.width * 0.10);
+  const sy = Math.round(sourceCanvas.height * 0.18);
+  const sw = Math.round(sourceCanvas.width * 0.80);
+  const sh = Math.round(sourceCanvas.height * 0.64);
+
+  const cropped = document.createElement('canvas');
+  cropped.width = sw;
+  cropped.height = sh;
+  const cctx = cropped.getContext('2d');
+  cctx.drawImage(sourceCanvas, sx, sy, sw, sh, 0, 0, sw, sh);
+
+  // Grayscale + contrast stretch + threshold: makes printed text stand out from
+  // paper grid-lines and glare, which noticeably reduces OCR noise on label photos.
+  const imgData = cctx.getImageData(0, 0, sw, sh);
+  const d = imgData.data;
+  let min = 255, max = 0;
+  const gray = new Uint8ClampedArray(sw * sh);
+  for(let i = 0, p = 0; i < d.length; i += 4, p++){
+    const g = 0.299*d[i] + 0.587*d[i+1] + 0.114*d[i+2];
+    gray[p] = g;
+    if(g < min) min = g;
+    if(g > max) max = g;
+  }
+  const range = Math.max(1, max - min);
+  const threshold = min + range * 0.55;
+  for(let i = 0, p = 0; i < d.length; i += 4, p++){
+    const v = gray[p] > threshold ? 255 : 0;
+    d[i] = d[i+1] = d[i+2] = v;
+  }
+  cctx.putImageData(imgData, 0, 0);
+  return cropped;
+}
+
+function performSearch(query, sourceLabel){
+  if(PARTS.length === 0){
+    setStatus('Load your part list first', true);
+    return;
+  }
+  const val = (query || '').trim();
+  if(!val){
+    setStatus('Enter a part number first', true);
+    return;
+  }
+  const matches = findMatch(val);
+  if(matches){
+    showPart(matches[0], matches);
+    setStatus((matches[0].score === 0 ? 'Exact match found' : 'Closest match found') + (sourceLabel ? '' : ''));
+  }else{
+    showNoMatch(val);
+    setStatus('No match', true);
+  }
+}
+
 async function runOcr(){
   if(PARTS.length === 0){
     setStatus('Load your part list first', true);
+    return;
+  }
+  if(!cameraStarted){
+    setStatus('Tap the camera preview to open it first', true);
     return;
   }
   captureBtn.disabled = true;
@@ -998,29 +1109,30 @@ async function runOcr(){
   ctx.drawImage(video, 0, 0, shot.width, shot.height);
 
   try{
-    const { data } = await Tesseract.recognize(shot, 'eng', {
+    const processed = preprocessForOcr(shot);
+    const { data } = await Tesseract.recognize(processed, 'eng', {
       logger: m => {
         if(m.status === 'recognizing text'){
           setStatus('Reading label… ' + Math.round(m.progress*100) + '%');
         }
-      }
+      },
+      tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-/. ',
+      tessedit_pageseg_mode: 6
     });
     const text = (data.text || '').trim();
     const detectedBox = document.getElementById('detectedBox');
-    const detectedText = document.getElementById('detectedText');
+    const detectedInput = document.getElementById('detectedInput');
     if(text){
-      detectedText.textContent = text.replace(/\n/g,'  ');
+      detectedInput.value = text.replace(/\n/g,' ').replace(/\s+/g,' ').trim();
       detectedBox.classList.add('show');
     }else{
       detectedBox.classList.remove('show');
     }
-    setStatus(text ? 'Text detected — see box above for exact reading' : 'No text detected');
-    const matches = findMatch(text);
-    if(matches){
-      showPart(matches[0], matches);
-      setStatus(matches[0].score === 0 ? 'Exact match found' : 'Closest match found (OCR may be imperfect)');
+    setStatus(text ? 'Text detected — review/edit below, then Search' : 'No text detected — try again or type it manually');
+    if(text){
+      performSearch(text, 'camera');
     }else{
-      showNoMatch(text.replace(/\n/g,' ').slice(0,60));
+      showNoMatch('');
     }
   }catch(err){
     setStatus('OCR failed: ' + err.message, true);
@@ -1031,25 +1143,16 @@ async function runOcr(){
 
 captureBtn.addEventListener('click', runOcr);
 
+document.getElementById('detectedSearchBtn').addEventListener('click', () => {
+  performSearch(document.getElementById('detectedInput').value, 'camera-edited');
+});
+document.getElementById('detectedInput').addEventListener('keydown', e => {
+  if(e.key === 'Enter') document.getElementById('detectedSearchBtn').click();
+});
+
 manualBtn.addEventListener('click', () => {
   document.getElementById('detectedBox').classList.remove('show');
-  if(PARTS.length === 0){
-    setStatus('Load your part list first', true);
-    return;
-  }
-  const val = manualInput.value.trim();
-  if(!val){
-    setStatus('Enter a part number first', true);
-    return;
-  }
-  const matches = findMatch(val);
-  if(matches){
-    showPart(matches[0], matches);
-    setStatus(matches[0].score === 0 ? 'Exact match found' : 'Closest match found');
-  }else{
-    showNoMatch(val);
-    setStatus('No match', true);
-  }
+  performSearch(manualInput.value, 'manual');
 });
 manualInput.addEventListener('keydown', e => { if(e.key === 'Enter') manualBtn.click(); });
 
