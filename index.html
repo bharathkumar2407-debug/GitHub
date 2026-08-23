@@ -525,13 +525,43 @@ function mapRowToPart(row){
   return part;
 }
 
+const ALL_ALIASES = Object.values(KEY_FIELD_ALIASES).flat();
+
+function findHeaderRow(matrix){
+  const scanLimit = Math.min(matrix.length, 15);
+  let bestRow = 0, bestScore = -1;
+  for(let i = 0; i < scanLimit; i++){
+    const row = matrix[i] || [];
+    let score = 0;
+    for(const cell of row){
+      const nc = normalizeHeader(cell);
+      if(ALL_ALIASES.includes(nc)) score++;
+    }
+    if(score > bestScore){
+      bestScore = score;
+      bestRow = i;
+    }
+  }
+  return bestScore > 0 ? bestRow : 0;
+}
+
 function loadPartsFromWorkbook(workbook){
-  const sheetName = workbook.SheetNames[0];
-  const sheet = workbook.Sheets[sheetName];
-  const rows = XLSX.utils.sheet_to_json(sheet, { defval:'' });
-  const parts = rows
-    .map(mapRowToPart)
-    .filter(p => p.part_no);
+  let parts = [];
+  for(const sheetName of workbook.SheetNames){
+    const sheet = workbook.Sheets[sheetName];
+    const matrix = XLSX.utils.sheet_to_json(sheet, { header:1, defval:'', blankrows:false });
+    if(matrix.length < 2) continue;
+    const headerRowIdx = findHeaderRow(matrix);
+    const headers = matrix[headerRowIdx];
+    const dataRows = matrix.slice(headerRowIdx + 1);
+    const rows = dataRows.map(r => {
+      const obj = {};
+      headers.forEach((h, i) => { if(h) obj[h] = r[i]; });
+      return obj;
+    });
+    const sheetParts = rows.map(mapRowToPart).filter(p => p.part_no);
+    parts = parts.concat(sheetParts);
+  }
   return parts;
 }
 
@@ -541,24 +571,72 @@ function updateDataCount(){
     countEl.textContent = 'No file loaded';
     countEl.classList.add('zero');
   }else{
-    countEl.textContent = PARTS.length + ' parts loaded';
+    countEl.textContent = PARTS.length.toLocaleString() + ' parts loaded';
     countEl.classList.remove('zero');
   }
 }
 
-function saveToLocalStorage(filename){
-  try{
-    localStorage.setItem('partScannerData', JSON.stringify(PARTS));
-    localStorage.setItem('partScannerFilename', filename || '');
-  }catch(e){}
+// ---- IndexedDB storage (handles large datasets; localStorage caps out around 5-10MB) ----
+const IDB_NAME = 'partScannerDB';
+const IDB_STORE = 'data';
+
+function idbOpen(){
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(IDB_NAME, 1);
+    req.onupgradeneeded = () => req.result.createObjectStore(IDB_STORE);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
 }
 
-function restoreFromLocalStorage(){
+async function idbSet(key, value){
   try{
-    const saved = localStorage.getItem('partScannerData');
-    const filename = localStorage.getItem('partScannerFilename');
-    if(saved){
-      PARTS = JSON.parse(saved);
+    const db = await idbOpen();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(IDB_STORE, 'readwrite');
+      tx.objectStore(IDB_STORE).put(value, key);
+      tx.oncomplete = () => resolve(true);
+      tx.onerror = () => reject(tx.error);
+    });
+  }catch(e){ return false; }
+}
+
+async function idbGet(key){
+  try{
+    const db = await idbOpen();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(IDB_STORE, 'readonly');
+      const req = tx.objectStore(IDB_STORE).get(key);
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+  }catch(e){ return undefined; }
+}
+
+async function idbClear(){
+  try{
+    const db = await idbOpen();
+    return new Promise((resolve) => {
+      const tx = db.transaction(IDB_STORE, 'readwrite');
+      tx.objectStore(IDB_STORE).clear();
+      tx.oncomplete = () => resolve(true);
+    });
+  }catch(e){ return false; }
+}
+
+async function saveDataset(filename){
+  await idbSet('parts', PARTS);
+  await idbSet('filename', filename || '');
+  buildSearchIndex();
+}
+
+async function restoreDataset(){
+  try{
+    const saved = await idbGet('parts');
+    const filename = await idbGet('filename');
+    if(saved && saved.length){
+      PARTS = saved;
+      buildSearchIndex();
       updateDataCount();
       if(filename){
         document.getElementById('dataFilename').textContent = 'Loaded from: ' + filename;
@@ -574,35 +652,52 @@ document.getElementById('loadBtn').addEventListener('click', () => {
 document.getElementById('fileInput').addEventListener('change', (e) => {
   const file = e.target.files[0];
   if(!file) return;
+  const loadBtn = document.getElementById('loadBtn');
+  loadBtn.disabled = true;
+  loadBtn.textContent = 'Reading file…';
+  document.getElementById('dataFilename').textContent = 'Reading ' + file.name + ' (' + (file.size/1024/1024).toFixed(1) + ' MB)…';
+
   const reader = new FileReader();
   reader.onload = (evt) => {
-    try{
-      const data = new Uint8Array(evt.target.result);
-      const workbook = XLSX.read(data, { type:'array' });
-      PARTS = loadPartsFromWorkbook(workbook);
-      updateDataCount();
-      document.getElementById('dataFilename').textContent = PARTS.length
-        ? 'Loaded from: ' + file.name
-        : 'No matching rows found — check column headers';
-      saveToLocalStorage(file.name);
-      setStatus(PARTS.length + ' parts ready to match against');
-    }catch(err){
-      setStatus('Could not read file: ' + err.message, true);
-    }
+    // setTimeout lets the UI paint the "reading" status before the heavy parse blocks the thread
+    setTimeout(() => {
+      try{
+        const data = new Uint8Array(evt.target.result);
+        loadBtn.textContent = 'Parsing rows…';
+        const workbook = XLSX.read(data, { type:'array' });
+        PARTS = loadPartsFromWorkbook(workbook);
+        updateDataCount();
+        document.getElementById('dataFilename').textContent = PARTS.length
+          ? 'Loaded from: ' + file.name
+          : 'No matching rows found — check column headers';
+        setStatus(PARTS.length.toLocaleString() + ' parts ready to match against');
+        saveDataset(file.name).catch(() => {});
+      }catch(err){
+        setStatus('Could not read file: ' + err.message, true);
+      }finally{
+        loadBtn.disabled = false;
+        loadBtn.textContent = 'Load Excel file';
+      }
+    }, 30);
+  };
+  reader.onerror = () => {
+    setStatus('Could not read file', true);
+    loadBtn.disabled = false;
+    loadBtn.textContent = 'Load Excel file';
   };
   reader.readAsArrayBuffer(file);
 });
 
 document.getElementById('clearBtn').addEventListener('click', () => {
   PARTS = [];
+  EXACT_INDEX = {};
   updateDataCount();
   document.getElementById('dataFilename').textContent = '';
-  localStorage.removeItem('partScannerData');
-  localStorage.removeItem('partScannerFilename');
+  idbClear();
   setStatus('Part list cleared');
 });
 
-restoreFromLocalStorage();
+restoreDataset();
 
 const video = document.getElementById('video');
 const shot = document.getElementById('shot');
@@ -646,7 +741,6 @@ function setStatus(text, isErr){
 }
 
 function levenshtein(a, b){
-  a = a.toUpperCase(); b = b.toUpperCase();
   const m = a.length, n = b.length;
   const dp = Array.from({length:m+1}, () => new Array(n+1).fill(0));
   for(let i=0;i<=m;i++) dp[i][0]=i;
@@ -662,45 +756,112 @@ function levenshtein(a, b){
 }
 
 function cleanToken(t){
-  return t.toUpperCase().replace(/[^A-Z0-9\-]/g,'');
+  return String(t).toUpperCase().replace(/[^A-Z0-9\-]/g,'');
 }
 
-function scoreField(token, fieldValue){
-  if(!fieldValue) return null;
-  const clean = cleanToken(fieldValue);
-  if(!clean) return null;
-  if(token === clean) return 0;
-  if(clean.includes(token) && token.length >= 4) return 0.5;
-  const dist = levenshtein(token, clean);
-  const threshold = Math.max(1, Math.floor(clean.length * 0.25));
-  return dist <= threshold ? dist : null;
-}
+// ---- Search index: built once per dataset load so lookups stay fast at 25k+ rows ----
+// EXACT_INDEX: cleaned field value -> [{part, field}]  (O(1) exact lookup)
+// LENGTH_INDEX: field -> length -> [{part, clean}]     (bucketed for bounded fuzzy fallback)
+let EXACT_INDEX = {};
+let LENGTH_INDEX = {};
+let WORD_INDEX = {};
+const WORD_FIELDS = ['desc','old_desc','spec','old_spec'];
 
-function rankMatches(rawText){
-  const tokens = rawText
-    .split(/[\s\n]+/)
-    .map(cleanToken)
-    .filter(t => t.length >= 3);
+function buildSearchIndex(){
+  EXACT_INDEX = {};
+  LENGTH_INDEX = {};
+  WORD_INDEX = {};
+  for(const field of SEARCH_FIELDS) LENGTH_INDEX[field] = {};
 
-  if(tokens.length === 0) return [];
-
-  const results = [];
   for(const part of PARTS){
-    let bestScore = Infinity;
-    let bestField = null;
-    for(const token of tokens){
-      for(const field of SEARCH_FIELDS){
-        const s = scoreField(token, part[field]);
-        if(s !== null && s < bestScore){
-          bestScore = s;
-          bestField = field;
+    for(const field of SEARCH_FIELDS){
+      const raw = part[field];
+      if(!raw) continue;
+      const clean = cleanToken(raw);
+      if(!clean) continue;
+
+      if(!EXACT_INDEX[clean]) EXACT_INDEX[clean] = [];
+      EXACT_INDEX[clean].push({ part, field });
+
+      const len = clean.length;
+      if(!LENGTH_INDEX[field][len]) LENGTH_INDEX[field][len] = [];
+      LENGTH_INDEX[field][len].push({ part, clean });
+
+      if(WORD_FIELDS.includes(field)){
+        const words = String(raw).toUpperCase().split(/[^A-Z0-9]+/).filter(w => w.length >= 3);
+        for(const word of words){
+          if(!WORD_INDEX[word]) WORD_INDEX[word] = [];
+          WORD_INDEX[word].push({ part, field });
         }
       }
     }
-    if(bestField){
-      results.push({ part, score:bestScore, field:bestField });
+  }
+}
+
+function fuzzyCandidatesForToken(token, field){
+  const bucket = LENGTH_INDEX[field];
+  const threshold = Math.max(1, Math.floor(token.length * 0.25));
+  const matches = [];
+  for(let len = token.length - threshold; len <= token.length + threshold; len++){
+    const entries = bucket[len];
+    if(!entries) continue;
+    for(const entry of entries){
+      const dist = levenshtein(token, entry.clean);
+      if(dist <= threshold){
+        matches.push({ part:entry.part, field, score:dist });
+      }
     }
   }
+  return matches;
+}
+
+function rankMatches(rawText){
+  const tokens = Array.from(new Set(
+    rawText.split(/[\s\n]+/).map(cleanToken).filter(t => t.length >= 3)
+  )).slice(0, 12); // cap tokens considered, to bound worst-case work on noisy OCR text
+
+  if(tokens.length === 0) return [];
+
+  const byPart = new Map(); // part -> best {score, field}
+
+  // Pass 1: exact matches (fast, O(1) per token) — whole-field, then word-level for descriptions/specs
+  for(const token of tokens){
+    const hits = EXACT_INDEX[token];
+    if(hits){
+      for(const hit of hits){
+        const existing = byPart.get(hit.part);
+        if(!existing || 0 < existing.score){
+          byPart.set(hit.part, { score:0, field:hit.field });
+        }
+      }
+    }
+    const wordHits = WORD_INDEX[token];
+    if(wordHits){
+      for(const hit of wordHits){
+        const existing = byPart.get(hit.part);
+        if(!existing || 0.2 < existing.score){
+          byPart.set(hit.part, { score:0.2, field:hit.field });
+        }
+      }
+    }
+  }
+
+  // Pass 2: only run bounded fuzzy search if nothing matched exactly
+  if(byPart.size === 0){
+    for(const token of tokens){
+      for(const field of SEARCH_FIELDS){
+        const candidates = fuzzyCandidatesForToken(token, field);
+        for(const c of candidates){
+          const existing = byPart.get(c.part);
+          if(!existing || c.score < existing.score){
+            byPart.set(c.part, { score:c.score, field:c.field });
+          }
+        }
+      }
+    }
+  }
+
+  const results = Array.from(byPart.entries()).map(([part, m]) => ({ part, score:m.score, field:m.field }));
   results.sort((a,b) => a.score - b.score);
   return results;
 }
