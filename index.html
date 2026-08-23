@@ -1094,12 +1094,85 @@ function preprocessForOcr(sourceCanvas){
     gray[p] = 0.299*d[i] + 0.587*d[i+1] + 0.114*d[i+2];
   }
   const threshold = otsuThreshold(gray, pixelCount);
+  // fg = true means "ink" (darker than threshold) — candidate text pixel
+  const fg = new Uint8Array(pixelCount);
+  for(let p = 0; p < pixelCount; p++) fg[p] = gray[p] <= threshold ? 1 : 0;
+
+  removeGridLines(fg, outW, outH);
+
   for(let i = 0, p = 0; i < d.length; i += 4, p++){
-    const v = gray[p] > threshold ? 255 : 0;
+    const v = fg[p] ? 0 : 255;
     d[i] = d[i+1] = d[i+2] = v;
   }
   cctx.putImageData(imgData, 0, 0);
   return cropped;
+}
+
+function localThickness(original, w, h, isHorizontal, fixedCoord, t, band){
+  let thickness = 0;
+  for(let d = -band; d <= band; d++){
+    if(isHorizontal){
+      const yy = fixedCoord + d;
+      if(yy >= 0 && yy < h && original[yy*w + t] === 1) thickness++;
+    }else{
+      const xx = fixedCoord + d;
+      if(xx >= 0 && xx < w && original[t*w + xx] === 1) thickness++;
+    }
+  }
+  return thickness;
+}
+
+function removeGridLines(fg, w, h){
+  // Erases long, thin, straight runs of ink — that's what a printed grid line looks like
+  // after thresholding. Real character strokes are short and comparatively thick, so they
+  // survive this pass. Graph-paper backgrounds are what caused the extra garbled characters.
+  // Both directions are measured against the original data so erasing horizontal lines
+  // doesn't fragment (and hide) the vertical lines from detection, and vice versa.
+  // Within a run long enough to be a line candidate, each pixel is judged individually —
+  // so if text happens to cross the line's path, that thicker local stretch is preserved
+  // instead of the whole run being erased as one unit.
+  const original = fg.slice();
+  const minRunFraction = 0.5;
+  const maxThickness = 3;
+  const band = 3;
+
+  const minRunW = Math.round(w * minRunFraction);
+  for(let y = 0; y < h; y++){
+    let runStart = -1;
+    for(let x = 0; x <= w; x++){
+      const isFg = x < w && original[y*w + x] === 1;
+      if(isFg && runStart === -1) runStart = x;
+      if(!isFg && runStart !== -1){
+        if(x - runStart >= minRunW){
+          for(let xi = runStart; xi < x; xi++){
+            if(localThickness(original, w, h, true, y, xi, band) <= maxThickness){
+              fg[y*w + xi] = 0;
+            }
+          }
+        }
+        runStart = -1;
+      }
+    }
+  }
+
+  const minRunH = Math.round(h * minRunFraction);
+  for(let x = 0; x < w; x++){
+    let runStart = -1;
+    for(let y = 0; y <= h; y++){
+      const isFg = y < h && original[y*w + x] === 1;
+      if(isFg && runStart === -1) runStart = y;
+      if(!isFg && runStart !== -1){
+        if(y - runStart >= minRunH){
+          for(let yi = runStart; yi < y; yi++){
+            if(localThickness(original, w, h, false, x, yi, band) <= maxThickness){
+              fg[yi*w + x] = 0;
+            }
+          }
+        }
+        runStart = -1;
+      }
+    }
+  }
 }
 
 
