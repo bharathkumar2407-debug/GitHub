@@ -123,11 +123,14 @@
     display:block;
   }
   canvas.shot{ display:none; }
+  canvas.shot.show{ display:block; position:absolute; inset:0; }
+  video.hide{ display:none; }
   .frame{
     position:absolute;
     inset:18% 10%;
     pointer-events:none;
   }
+  .frame.hide{ display:none; }
   .frame::before,.frame::after,.frame i::before,.frame i::after{
     content:'';
     position:absolute;
@@ -151,6 +154,7 @@
     text-shadow:0 1px 3px rgba(0,0,0,0.8);
     letter-spacing:0.5px;
   }
+  .hint.hide{ display:none; }
   .cam-placeholder{
     position:absolute;
     inset:0;
@@ -166,6 +170,44 @@
   }
   .cam-placeholder.hide{ display:none; }
   .cam-icon{ font-size:40px; }
+
+  .selection-box{
+    position:absolute;
+    display:none;
+    border:2px solid var(--amber);
+    background:rgba(242,169,59,0.12);
+    touch-action:none;
+    cursor:move;
+  }
+  .selection-box.show{ display:block; }
+  .selection-box .handle{
+    position:absolute;
+    width:26px;
+    height:26px;
+    margin:-13px;
+    background:var(--amber);
+    border-radius:50%;
+    border:2px solid #241905;
+    touch-action:none;
+  }
+  .selection-box .handle.tl{ top:0; left:0; cursor:nwse-resize; }
+  .selection-box .handle.tr{ top:0; left:100%; cursor:nesw-resize; }
+  .selection-box .handle.bl{ top:100%; left:0; cursor:nesw-resize; }
+  .selection-box .handle.br{ top:100%; left:100%; cursor:nwse-resize; }
+  .mark-hint{
+    position:absolute;
+    bottom:8px;left:0;right:0;
+    text-align:center;
+    font-size:11px;
+    font-family:var(--mono);
+    color:#fff;
+    text-shadow:0 1px 3px rgba(0,0,0,0.8);
+    letter-spacing:0.5px;
+    display:none;
+    pointer-events:none;
+  }
+  .mark-hint.show{ display:block; }
+
   .controls{
     display:flex;
     gap:10px;
@@ -470,7 +512,7 @@
     <input type="file" id="fileInput" accept=".xlsx,.xls,.csv">
   </div>
 
-  <div class="camera-wrap">
+  <div class="camera-wrap" id="cameraWrap">
     <video id="video" autoplay playsinline muted></video>
     <canvas id="shot" class="shot"></canvas>
     <div class="frame"><i></i></div>
@@ -479,11 +521,22 @@
       <div class="cam-icon">&#128247;</div>
       <div>Tap to open camera</div>
     </div>
+    <div class="selection-box" id="selectionBox">
+      <div class="handle tl" data-corner="tl"></div>
+      <div class="handle tr" data-corner="tr"></div>
+      <div class="handle bl" data-corner="bl"></div>
+      <div class="handle br" data-corner="br"></div>
+    </div>
+    <div class="mark-hint" id="markHint">Drag the box over the part number, then Read selection</div>
   </div>
 
-  <div class="controls">
-    <button class="primary" id="captureBtn">Scan label</button>
+  <div class="controls" id="liveControls">
+    <button class="primary" id="captureBtn">Capture photo</button>
     <button id="switchBtn" title="Switch camera">Flip</button>
+  </div>
+  <div class="controls" id="markControls" style="display:none">
+    <button class="primary" id="readSelectionBtn">Read selection</button>
+    <button id="retakeBtn">Retake</button>
   </div>
 
   <div class="manual">
@@ -1062,13 +1115,13 @@ function otsuThreshold(gray, length){
   return threshold;
 }
 
-function preprocessForOcr(sourceCanvas){
-  // Crop to the visible guide frame (inset 18% top/bottom, 10% left/right — matches the CSS overlay)
-  // so grid-paper background and glare outside the label don't confuse the OCR engine.
-  const sx = Math.round(sourceCanvas.width * 0.10);
-  const sy = Math.round(sourceCanvas.height * 0.18);
-  const sw = Math.round(sourceCanvas.width * 0.80);
-  const sh = Math.round(sourceCanvas.height * 0.64);
+function preprocessForOcr(sourceCanvas, cropRect){
+  // cropRect gives the exact region the person marked by hand — far more reliable
+  // than guessing a fixed frame percentage, since they can match it to the label exactly.
+  const sx = Math.max(0, Math.round(cropRect.x));
+  const sy = Math.max(0, Math.round(cropRect.y));
+  const sw = Math.max(1, Math.round(cropRect.w));
+  const sh = Math.max(1, Math.round(cropRect.h));
 
   // OCR engines read small text unreliably — upscale so the cropped text has real pixel height.
   const targetHeight = 320;
@@ -1196,7 +1249,35 @@ function performSearch(query, sourceLabel){
   }
 }
 
-async function runOcr(){
+// ---- Capture then mark: freeze a photo, let the person drag a box over the exact
+// text to read, mirroring how Google Lens/Translate let you mark text by hand. ----
+const cameraWrap = document.getElementById('cameraWrap');
+const selectionBox = document.getElementById('selectionBox');
+const liveControls = document.getElementById('liveControls');
+const markControls = document.getElementById('markControls');
+const markHint = document.getElementById('markHint');
+const guideFrame = document.querySelector('.frame');
+
+// Selection stored as fractions of the wrap's size, so it stays correct across redraws.
+let selRect = { x: 0.10, y: 0.18, w: 0.80, h: 0.64 };
+
+function layoutSelectionBox(){
+  const w = cameraWrap.clientWidth, h = cameraWrap.clientHeight;
+  selectionBox.style.left = (selRect.x * w) + 'px';
+  selectionBox.style.top = (selRect.y * h) + 'px';
+  selectionBox.style.width = (selRect.w * w) + 'px';
+  selectionBox.style.height = (selRect.h * h) + 'px';
+}
+
+function clampSelRect(){
+  const minSize = 0.06;
+  selRect.w = Math.max(minSize, Math.min(1, selRect.w));
+  selRect.h = Math.max(minSize, Math.min(1, selRect.h));
+  selRect.x = Math.max(0, Math.min(1 - selRect.w, selRect.x));
+  selRect.y = Math.max(0, Math.min(1 - selRect.h, selRect.y));
+}
+
+function capturePhoto(){
   if(PARTS.length === 0){
     setStatus('Load your part list first', true);
     return;
@@ -1205,19 +1286,103 @@ async function runOcr(){
     setStatus('Tap the camera preview to open it first', true);
     return;
   }
-  captureBtn.disabled = true;
-  setStatus('Reading label…');
   const ctx = shot.getContext('2d');
   shot.width = video.videoWidth;
   shot.height = video.videoHeight;
   ctx.drawImage(video, 0, 0, shot.width, shot.height);
 
+  video.classList.add('hide');
+  shot.classList.add('show');
+  guideFrame.classList.add('hide');
+  hintEl.classList.add('hide');
+  camPlaceholder.classList.add('hide');
+  selectionBox.classList.add('show');
+  markHint.classList.add('show');
+  liveControls.style.display = 'none';
+  markControls.style.display = 'flex';
+  document.getElementById('detectedBox').classList.remove('show');
+
+  layoutSelectionBox();
+  setStatus('Drag the box over the part number, then tap Read selection');
+}
+
+function retakePhoto(){
+  video.classList.remove('hide');
+  shot.classList.remove('show');
+  guideFrame.classList.remove('hide');
+  hintEl.classList.remove('hide');
+  selectionBox.classList.remove('show');
+  markHint.classList.remove('show');
+  liveControls.style.display = 'flex';
+  markControls.style.display = 'none';
+  setStatus('');
+}
+
+// Dragging (move box) and resizing (drag a corner handle) via pointer events —
+// works for touch and mouse alike.
+let dragMode = null; // 'move' | 'tl' | 'tr' | 'bl' | 'br'
+let dragStartPointer = { x:0, y:0 };
+let dragStartRect = null;
+
+function onPointerDown(e, mode){
+  dragMode = mode;
+  dragStartPointer = { x:e.clientX, y:e.clientY };
+  dragStartRect = { ...selRect };
+  e.preventDefault();
+}
+
+selectionBox.addEventListener('pointerdown', (e) => {
+  if(e.target.classList.contains('handle')) return; // handles manage their own drag
+  onPointerDown(e, 'move');
+});
+selectionBox.querySelectorAll('.handle').forEach(h => {
+  h.addEventListener('pointerdown', (e) => {
+    e.stopPropagation();
+    onPointerDown(e, h.dataset.corner);
+  });
+});
+
+window.addEventListener('pointermove', (e) => {
+  if(!dragMode) return;
+  const w = cameraWrap.clientWidth, h = cameraWrap.clientHeight;
+  const dx = (e.clientX - dragStartPointer.x) / w;
+  const dy = (e.clientY - dragStartPointer.y) / h;
+
+  if(dragMode === 'move'){
+    selRect.x = dragStartRect.x + dx;
+    selRect.y = dragStartRect.y + dy;
+  }else{
+    let { x, y, w:rw, h:rh } = dragStartRect;
+    if(dragMode === 'tl'){ x += dx; y += dy; rw -= dx; rh -= dy; }
+    if(dragMode === 'tr'){ y += dy; rw += dx; rh -= dy; }
+    if(dragMode === 'bl'){ x += dx; rw -= dx; rh += dy; }
+    if(dragMode === 'br'){ rw += dx; rh += dy; }
+    selRect = { x, y, w:rw, h:rh };
+  }
+  clampSelRect();
+  layoutSelectionBox();
+});
+window.addEventListener('pointerup', () => { dragMode = null; });
+window.addEventListener('resize', () => { if(selectionBox.classList.contains('show')) layoutSelectionBox(); });
+
+async function readSelection(){
+  const readBtn = document.getElementById('readSelectionBtn');
+  readBtn.disabled = true;
+  setStatus('Reading selection…');
+
+  const cropRect = {
+    x: selRect.x * shot.width,
+    y: selRect.y * shot.height,
+    w: selRect.w * shot.width,
+    h: selRect.h * shot.height
+  };
+
   try{
-    const processed = preprocessForOcr(shot);
+    const processed = preprocessForOcr(shot, cropRect);
     const { data } = await Tesseract.recognize(processed, 'eng', {
       logger: m => {
         if(m.status === 'recognizing text'){
-          setStatus('Reading label… ' + Math.round(m.progress*100) + '%');
+          setStatus('Reading selection… ' + Math.round(m.progress*100) + '%');
         }
       },
       tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-/. ',
@@ -1232,7 +1397,7 @@ async function runOcr(){
     }else{
       detectedBox.classList.remove('show');
     }
-    setStatus(text ? 'Text detected — review/edit below, then Search' : 'No text detected — try again or type it manually');
+    setStatus(text ? 'Text detected — review/edit below, then Search' : 'No text detected in that selection — try adjusting the box');
     if(text){
       performSearch(text, 'camera');
     }else{
@@ -1241,11 +1406,13 @@ async function runOcr(){
   }catch(err){
     setStatus('OCR failed: ' + err.message, true);
   }finally{
-    captureBtn.disabled = false;
+    readBtn.disabled = false;
   }
 }
 
-captureBtn.addEventListener('click', runOcr);
+captureBtn.addEventListener('click', capturePhoto);
+document.getElementById('readSelectionBtn').addEventListener('click', readSelection);
+document.getElementById('retakeBtn').addEventListener('click', retakePhoto);
 
 document.getElementById('detectedSearchBtn').addEventListener('click', () => {
   performSearch(document.getElementById('detectedInput').value, 'camera-edited');
