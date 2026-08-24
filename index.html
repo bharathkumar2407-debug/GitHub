@@ -121,6 +121,7 @@
     height:100%;
     object-fit:cover;
     display:block;
+    touch-action:none;
   }
   canvas.shot{ display:none; }
   canvas.shot.show{ display:block; position:absolute; inset:0; }
@@ -207,6 +208,45 @@
     pointer-events:none;
   }
   .mark-hint.show{ display:block; }
+
+  .zoom-badge{
+    position:absolute;
+    top:8px;right:8px;
+    background:rgba(0,0,0,0.6);
+    color:#fff;
+    font-family:var(--mono);
+    font-size:11px;
+    padding:3px 8px;
+    border-radius:20px;
+    display:none;
+    pointer-events:none;
+  }
+  .zoom-badge.show{ display:block; }
+
+  .mini-controls{
+    display:flex;
+    gap:8px;
+    margin-top:8px;
+  }
+  .mini-btn{
+    flex:1;
+    padding:8px;
+    font-size:12px;
+    background:var(--panel-2);
+    color:var(--text-dim);
+  }
+  .mini-btn.active{
+    background:var(--amber);
+    color:#241905;
+    border-color:var(--amber);
+    font-weight:600;
+  }
+  .mini-btn.unsupported{
+    opacity:0.4;
+  }
+  video.night-mode, canvas.shot.night-mode{
+    filter: brightness(1.6) contrast(1.15);
+  }
 
   .controls{
     display:flex;
@@ -528,11 +568,16 @@
       <div class="handle br" data-corner="br"></div>
     </div>
     <div class="mark-hint" id="markHint">Drag the box over the part number, then Read selection</div>
+    <div class="zoom-badge" id="zoomBadge">1.0&times;</div>
   </div>
 
   <div class="controls" id="liveControls">
     <button class="primary" id="captureBtn">Capture photo</button>
     <button id="switchBtn" title="Switch camera">Flip</button>
+  </div>
+  <div class="mini-controls" id="miniControls">
+    <button id="torchBtn" class="mini-btn" title="Flash">&#9889; Flash</button>
+    <button id="nightBtn" class="mini-btn" title="Night mode">&#127769; Night mode</button>
   </div>
   <div class="controls" id="markControls" style="display:none">
     <button class="primary" id="readSelectionBtn">Read selection</button>
@@ -836,6 +881,11 @@ const camPlaceholder = document.getElementById('camPlaceholder');
 let currentStream = null;
 let facing = 'environment';
 let cameraStarted = false;
+let nativeZoomCaps = null; // { min, max, step } if the device supports real hardware zoom
+let currentZoom = 1;
+let torchOn = false;
+let torchSupported = false;
+let nightMode = false;
 
 async function startCamera(){
   if(currentStream){
@@ -849,17 +899,125 @@ async function startCamera(){
     hintEl.textContent = 'Align part number in frame';
     cameraStarted = true;
     camPlaceholder.classList.add('hide');
+    detectTrackCapabilities();
   }catch(err){
     hintEl.textContent = 'Camera unavailable — use manual entry below';
     setStatus('Camera error: ' + err.message, true);
   }
 }
 
+function detectTrackCapabilities(){
+  currentZoom = 1;
+  nativeZoomCaps = null;
+  torchSupported = false;
+  torchOn = false;
+  const track = currentStream && currentStream.getVideoTracks()[0];
+  const torchBtn = document.getElementById('torchBtn');
+  torchBtn.classList.remove('active');
+
+  if(track && track.getCapabilities){
+    try{
+      const caps = track.getCapabilities();
+      if(caps.zoom){
+        nativeZoomCaps = { min: caps.zoom.min, max: caps.zoom.max, step: caps.zoom.step || 0.1 };
+        currentZoom = track.getSettings().zoom || caps.zoom.min;
+      }
+      torchSupported = !!caps.torch;
+    }catch(e){}
+  }
+  torchBtn.classList.toggle('unsupported', !torchSupported);
+  updateZoomBadge();
+}
+
+function updateZoomBadge(){
+  const badge = document.getElementById('zoomBadge');
+  if(currentZoom > 1.02){
+    badge.textContent = currentZoom.toFixed(1) + '\u00d7';
+    badge.classList.add('show');
+  }else{
+    badge.classList.remove('show');
+  }
+}
+
+async function applyZoom(zoom){
+  const track = currentStream && currentStream.getVideoTracks()[0];
+  if(nativeZoomCaps && track){
+    const clamped = Math.max(nativeZoomCaps.min, Math.min(nativeZoomCaps.max, zoom));
+    currentZoom = clamped;
+    try{ await track.applyConstraints({ advanced:[{ zoom: clamped }] }); }catch(e){}
+  }else{
+    // No hardware zoom on this device/browser — fall back to a visual (digital) zoom
+    // to help you aim. Note this only affects what you see while framing; the photo
+    // is still captured at full native resolution either way, so it doesn't hurt.
+    currentZoom = Math.max(1, Math.min(4, zoom));
+    video.style.transform = `scale(${currentZoom})`;
+  }
+  updateZoomBadge();
+}
+
+// Two-finger pinch to zoom, live camera view only.
+let pinchStartDist = null;
+let pinchStartZoom = 1;
+const activeTouches = new Map();
+
+function touchDist(){
+  const pts = Array.from(activeTouches.values());
+  if(pts.length < 2) return null;
+  return Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
+}
+
+video.addEventListener('pointerdown', (e) => {
+  activeTouches.set(e.pointerId, { x:e.clientX, y:e.clientY });
+  if(activeTouches.size === 2){
+    pinchStartDist = touchDist();
+    pinchStartZoom = currentZoom;
+  }
+});
+video.addEventListener('pointermove', (e) => {
+  if(!activeTouches.has(e.pointerId)) return;
+  activeTouches.set(e.pointerId, { x:e.clientX, y:e.clientY });
+  if(activeTouches.size === 2 && pinchStartDist){
+    const dist = touchDist();
+    const ratio = dist / pinchStartDist;
+    applyZoom(pinchStartZoom * ratio);
+  }
+});
+['pointerup','pointercancel','pointerleave'].forEach(evt => {
+  video.addEventListener(evt, (e) => {
+    activeTouches.delete(e.pointerId);
+    if(activeTouches.size < 2) pinchStartDist = null;
+  });
+});
+
+document.getElementById('torchBtn').addEventListener('click', async () => {
+  const track = currentStream && currentStream.getVideoTracks()[0];
+  if(!torchSupported || !track){
+    setStatus('Flash isn\u2019t supported on this device/browser (common on iPhone \u2014 Apple restricts it for web pages)', true);
+    return;
+  }
+  torchOn = !torchOn;
+  try{
+    await track.applyConstraints({ advanced:[{ torch: torchOn }] });
+    document.getElementById('torchBtn').classList.toggle('active', torchOn);
+  }catch(e){
+    setStatus('Could not toggle flash on this device', true);
+    torchOn = !torchOn;
+  }
+});
+
+document.getElementById('nightBtn').addEventListener('click', () => {
+  nightMode = !nightMode;
+  video.classList.toggle('night-mode', nightMode);
+  shot.classList.toggle('night-mode', nightMode);
+  document.getElementById('nightBtn').classList.toggle('active', nightMode);
+});
+
 // Camera only opens when the person taps it — not automatically on page load.
 camPlaceholder.addEventListener('click', startCamera);
 
 switchBtn.addEventListener('click', () => {
   facing = facing === 'environment' ? 'user' : 'environment';
+  video.style.transform = '';
   startCamera();
 });
 
@@ -1303,7 +1461,8 @@ function capturePhoto(){
   document.getElementById('detectedBox').classList.remove('show');
 
   layoutSelectionBox();
-  setStatus('Drag the box over the part number, then tap Read selection');
+  setStatus('Reading…');
+  readSelection(); // first-pass read with the default box; drag/resize and hit Read selection again to refine
 }
 
 function retakePhoto(){
