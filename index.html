@@ -899,7 +899,21 @@ async function startCamera(){
     hintEl.textContent = 'Align part number in frame';
     cameraStarted = true;
     camPlaceholder.classList.add('hide');
+
+    // Reset once per new camera/stream — a different camera (e.g. after Flip) may
+    // have entirely different hardware capabilities than the previous one.
+    currentZoom = 1;
+    nativeZoomCaps = null;
+    torchSupported = false;
+    torchOn = false;
+    video.style.transform = '';
+    document.getElementById('torchBtn').classList.remove('active');
+
     detectTrackCapabilities();
+    // Capabilities can be incomplete immediately after getUserMedia resolves on some
+    // Android/Chrome builds — re-check once the video has actually started playing.
+    video.addEventListener('loadedmetadata', detectTrackCapabilities, { once:true });
+    setTimeout(detectTrackCapabilities, 600);
   }catch(err){
     hintEl.textContent = 'Camera unavailable — use manual entry below';
     setStatus('Camera error: ' + err.message, true);
@@ -907,22 +921,17 @@ async function startCamera(){
 }
 
 function detectTrackCapabilities(){
-  currentZoom = 1;
-  nativeZoomCaps = null;
-  torchSupported = false;
-  torchOn = false;
   const track = currentStream && currentStream.getVideoTracks()[0];
   const torchBtn = document.getElementById('torchBtn');
-  torchBtn.classList.remove('active');
 
   if(track && track.getCapabilities){
     try{
       const caps = track.getCapabilities();
-      if(caps.zoom){
+      if(caps.zoom && !nativeZoomCaps){
         nativeZoomCaps = { min: caps.zoom.min, max: caps.zoom.max, step: caps.zoom.step || 0.1 };
         currentZoom = track.getSettings().zoom || caps.zoom.min;
       }
-      torchSupported = !!caps.torch;
+      if(caps.torch) torchSupported = true; // only ever upgrades false->true; never downgrades an already-confirmed capability
     }catch(e){}
   }
   torchBtn.classList.toggle('unsupported', !torchSupported);
@@ -991,17 +1000,20 @@ video.addEventListener('pointermove', (e) => {
 
 document.getElementById('torchBtn').addEventListener('click', async () => {
   const track = currentStream && currentStream.getVideoTracks()[0];
-  if(!torchSupported || !track){
-    setStatus('Flash isn\u2019t supported on this device/browser (common on iPhone \u2014 Apple restricts it for web pages)', true);
+  if(!track){
+    setStatus('Open the camera first', true);
     return;
   }
-  torchOn = !torchOn;
+  const wantOn = !torchOn;
   try{
-    await track.applyConstraints({ advanced:[{ torch: torchOn }] });
+    await track.applyConstraints({ advanced:[{ torch: wantOn }] });
+    torchOn = wantOn;
+    torchSupported = true;
+    document.getElementById('torchBtn').classList.remove('unsupported');
     document.getElementById('torchBtn').classList.toggle('active', torchOn);
   }catch(e){
-    setStatus('Could not toggle flash on this device', true);
-    torchOn = !torchOn;
+    document.getElementById('torchBtn').classList.add('unsupported');
+    setStatus('Flash isn\u2019t supported on this camera/browser (common on iPhone \u2014 Apple restricts it for web pages; on Android it can also depend on the specific phone)', true);
   }
 });
 
@@ -1524,6 +1536,43 @@ window.addEventListener('pointermove', (e) => {
 window.addEventListener('pointerup', () => { dragMode = null; });
 window.addEventListener('resize', () => { if(selectionBox.classList.contains('show')) layoutSelectionBox(); });
 
+// Tesseract's default model favors speed over accuracy. "tessdata_best" is the same
+// underlying open-source engine, using its more accurate (but larger, slower-to-download)
+// trained model — worth it for label reading where a misread character means a wrong part.
+// Falls back automatically to the default model if the bigger download fails for any reason
+// (offline on first-ever use, blocked network, etc.) so scanning never breaks outright.
+let bestModelFailed = false;
+
+async function recognizeText(image){
+  const baseOptions = {
+    logger: m => {
+      if(m.status === 'recognizing text'){
+        setStatus('Reading selection… ' + Math.round(m.progress*100) + '%');
+      }else if(m.status === 'loading language traineddata'){
+        setStatus('Downloading better recognition model (one-time)… ' + Math.round((m.progress||0)*100) + '%');
+      }
+    },
+    tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-/. ',
+    tessedit_pageseg_mode: 11
+  };
+
+  if(!bestModelFailed){
+    try{
+      const result = await Tesseract.recognize(image, 'eng', {
+        ...baseOptions,
+        langPath: 'https://cdn.jsdelivr.net/gh/tesseract-ocr/tessdata_best@main',
+        gzip: false
+      });
+      return result.data;
+    }catch(err){
+      bestModelFailed = true; // don't keep retrying the bigger download on every scan if it can't load
+    }
+  }
+
+  const result = await Tesseract.recognize(image, 'eng', baseOptions);
+  return result.data;
+}
+
 async function readSelection(){
   const readBtn = document.getElementById('readSelectionBtn');
   readBtn.disabled = true;
@@ -1538,15 +1587,7 @@ async function readSelection(){
 
   try{
     const processed = preprocessForOcr(shot, cropRect);
-    const { data } = await Tesseract.recognize(processed, 'eng', {
-      logger: m => {
-        if(m.status === 'recognizing text'){
-          setStatus('Reading selection… ' + Math.round(m.progress*100) + '%');
-        }
-      },
-      tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-/. ',
-      tessedit_pageseg_mode: 11
-    });
+    const data = await recognizeText(processed);
     const text = (data.text || '').trim();
     const detectedBox = document.getElementById('detectedBox');
     const detectedInput = document.getElementById('detectedInput');
